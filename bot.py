@@ -1,36 +1,50 @@
 """
-Bot Telegram — Tracking VA Instagram + GetMySocial + Supabase (Lot 1)
+Bot Telegram — Tracking VA Instagram + GetMySocial + Supabase (Lot 2)
 ---------------------------------------------------------------------
-Envoie des rapports automatiques dans le canal Telegram :
-    - 00h00 FR : Rapport CLICS (jour J-1 complet via GetMySocial)
-    - 09h30 FR : Rapport INSTAGRAM MATIN (vérif post 07h30)
-    - 12h00 FR : Rapport CLICS (depuis 00h00 du jour via GetMySocial)
-    - 20h00 FR : Rapport INSTAGRAM SOIR (vérif post 16h30)
-    - Dimanche 20h05 : RÉCAP HEBDO (classement VA + alertes sous-perf)
-    - 1er du mois 09h35 : RÉCAP MENSUEL
+Rapports automatiques :
+    - 00h00 FR : Clics jour J-1 complet
+    - 09h30 FR : Insta MATIN (vérif post 07h30)
+    - 12h00 FR : Clics depuis 00h00
+    - 20h00 FR : Insta SOIR (vérif post 16h30)
+    - Dimanche 20h05 : Récap hebdo
+    - 1er du mois 09h35 : Récap mensuel
 
-Alertes intelligentes (Niveau 1) :
-    - Shadowban : Reel < 30% de la moyenne des 7 derniers, 2 Reels consécutifs
+Alertes intelligentes :
+    - Shadowban : Reel < 30% moy 7 précédents, 2 Reels consécutifs
     - Chute clics : Jour J < 50% du jour J-1
     - VA sous-perf : 3+ ratés (❌ + ⚠️) sur 7 jours (dans récap dimanche)
 
+Commandes interactives (à taper dans le canal) :
+    /today          — snapshot live de tous les comptes
+    /stats USER     — stats d'un compte spécifique
+    /week           — récap des 7 derniers jours
+    /top            — top 3 Reels du jour
+    /leaderboard    — classement VA live
+    /pause USER     — met un compte en pause
+    /resume USER    — réactive un compte en pause
+    /help           — affiche les commandes
+
 Variables d'environnement requises (Railway) :
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, RAPIDAPI_KEY, GMS_API_KEY,
-    SUPABASE_URL (https://xxx.supabase.co), SUPABASE_KEY (anon)
+    SUPABASE_URL, SUPABASE_KEY,
+    GITHUB_TOKEN (PAT classic avec scope 'repo'),
+    GITHUB_REPO  (format owner/repo, ex: lucasdessoly2-lgtm/bot-tracking-va)
 
 Variables optionnelles :
-    RAPIDAPI_HOST, GMS_HOST
+    RAPIDAPI_HOST, GMS_HOST, GITHUB_BRANCH (par défaut 'main')
 """
 
+import base64
 import logging
 import os
 import re
+import time as time_module
 from datetime import datetime, time, timedelta, date
 from typing import Optional
 
 import pytz
 import requests
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from accounts import ACCOUNTS
 
@@ -46,6 +60,11 @@ GMS_API_KEY = os.environ.get("GMS_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")  # format: owner/repo
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+ACCOUNTS_FILE_PATH = "accounts.py"
+
 RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "instagram-scraper-20251.p.rapidapi.com")
 GMS_HOST = os.environ.get("GMS_HOST", "api.getmysocial.com")
 GMS_BASE_URL = f"https://{GMS_HOST}"
@@ -56,15 +75,15 @@ MATIN_TARGET = time(7, 30)
 SOIR_TARGET = time(16, 30)
 WINDOW_MINUTES = 30
 
-# --- Seuils d'alertes (Lot 1) ---
-SHADOWBAN_DROP_RATIO = 0.30       # 30% des vues moyennes (chute -70%)
-SHADOWBAN_CONSECUTIVE = 2          # 2 Reels consécutifs en chute
-SHADOWBAN_REFERENCE_REELS = 7      # comparé à la moyenne des 7 précédents
-CLICKS_DROP_RATIO = 0.50           # chute -50%
-CLICKS_DROP_MIN_BASELINE = 10      # ignore si <10 clics hier (bruit)
-VA_UNDERPERF_THRESHOLD = 3         # 3+ ratés
-VA_UNDERPERF_DAYS = 7              # sur 7 jours
-ALERT_DEDUP_HOURS = 24             # pas 2x la même alerte en 24h
+# --- Seuils d'alertes ---
+SHADOWBAN_DROP_RATIO = 0.30
+SHADOWBAN_CONSECUTIVE = 2
+SHADOWBAN_REFERENCE_REELS = 7
+CLICKS_DROP_RATIO = 0.50
+CLICKS_DROP_MIN_BASELINE = 10
+VA_UNDERPERF_THRESHOLD = 3
+VA_UNDERPERF_DAYS = 7
+ALERT_DEDUP_HOURS = 24
 
 # --- Cache GMS ---
 _GMS_LINKS_CACHE: dict = {}
@@ -79,7 +98,7 @@ log = logging.getLogger("bot")
 
 
 # ============================================================================
-#  TELEGRAM
+#  TELEGRAM (send + polling)
 # ============================================================================
 
 def send_telegram(text: str) -> None:
@@ -101,8 +120,28 @@ def send_telegram(text: str) -> None:
         log.error("Telegram exception: %s", e)
 
 
+def poll_telegram_updates(offset: int) -> list:
+    """Long polling Telegram pour récupérer les messages entrants."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {
+        "offset": offset,
+        "timeout": 25,
+        "allowed_updates": ["message", "channel_post"],
+    }
+    try:
+        r = requests.get(url, params=params, timeout=40)
+        if r.ok:
+            return r.json().get("result", [])
+        log.warning("getUpdates %s: %s", r.status_code, r.text[:200])
+    except requests.exceptions.Timeout:
+        pass  # normal pour long polling
+    except Exception as e:
+        log.error("Polling error: %s", e)
+    return []
+
+
 # ============================================================================
-#  SUPABASE — helpers HTTP (REST PostgREST)
+#  SUPABASE
 # ============================================================================
 
 def _sb_headers(prefer: str = "return=minimal") -> dict:
@@ -115,7 +154,6 @@ def _sb_headers(prefer: str = "return=minimal") -> dict:
 
 
 def supabase_select(table: str, query_params: Optional[dict] = None) -> list:
-    """SELECT depuis Supabase. query_params : dict de filtres PostgREST."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return []
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -135,16 +173,14 @@ def supabase_select(table: str, query_params: Optional[dict] = None) -> list:
 
 
 def supabase_upsert(table: str, payload: dict, on_conflict: str) -> bool:
-    """UPSERT (merge si conflit sur on_conflict)."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
     url = f"{SUPABASE_URL}/rest/v1/{table}"
-    params = {"on_conflict": on_conflict}
     try:
         r = requests.post(
             url,
             headers=_sb_headers(prefer="resolution=merge-duplicates,return=minimal"),
-            params=params,
+            params={"on_conflict": on_conflict},
             json=payload,
             timeout=30,
         )
@@ -168,6 +204,119 @@ def supabase_insert(table: str, payload: dict) -> bool:
     except Exception as e:
         log.error("SB INSERT %s exception: %s", table, e)
     return False
+
+
+# ============================================================================
+#  GITHUB (commit auto pour /pause et /resume)
+# ============================================================================
+
+def github_get_file(file_path: str) -> tuple:
+    """Renvoie (content_str, sha) du fichier ou (None, None) si erreur."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return None, None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        r = requests.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=30)
+        if not r.ok:
+            log.warning("GitHub GET %s -> %s %s", file_path, r.status_code, r.text[:200])
+            return None, None
+        data = r.json()
+        content_b64 = data.get("content", "")
+        sha = data.get("sha")
+        try:
+            content = base64.b64decode(content_b64).decode("utf-8")
+        except Exception:
+            return None, None
+        return content, sha
+    except Exception as e:
+        log.error("GitHub GET exception: %s", e)
+        return None, None
+
+
+def github_put_file(file_path: str, new_content: str, sha: str, message: str) -> bool:
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    payload = {
+        "message": message,
+        "content": base64.b64encode(new_content.encode("utf-8")).decode("utf-8"),
+        "sha": sha,
+        "branch": GITHUB_BRANCH,
+    }
+    try:
+        r = requests.put(url, headers=headers, json=payload, timeout=30)
+        if r.ok:
+            return True
+        log.warning("GitHub PUT %s -> %s %s", file_path, r.status_code, r.text[:200])
+    except Exception as e:
+        log.error("GitHub PUT exception: %s", e)
+    return False
+
+
+def toggle_account_pause(username: str, pause: bool) -> tuple:
+    """Met en pause (pause=True) ou réactive (pause=False) un username dans accounts.py.
+    Renvoie (success: bool, response_message: str)."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return False, "⚠️ GitHub non configuré (GITHUB_TOKEN / GITHUB_REPO manquant)."
+
+    content, sha = github_get_file(ACCOUNTS_FILE_PATH)
+    if not content:
+        return False, "⚠️ Impossible de lire accounts.py depuis GitHub."
+
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    found_line_idx = None
+
+    for idx, line in enumerate(lines):
+        # Regarde si la ligne contient `("username", ...)` avec ou sans # devant
+        # Match insensible à la casse
+        if re.search(rf'\(\s*"{re.escape(username)}"\s*,', line, re.IGNORECASE):
+            stripped = line.lstrip()
+            is_commented = stripped.startswith("#")
+            if pause:
+                if is_commented:
+                    new_lines.append(line)
+                    return False, f"ℹ️ <code>{username}</code> est déjà en pause."
+                # Ajouter # devant (en préservant l'indentation)
+                indent = line[:len(line) - len(stripped)]
+                line = f"{indent}# {stripped}"
+                found_line_idx = idx
+            else:
+                if not is_commented:
+                    new_lines.append(line)
+                    return False, f"ℹ️ <code>{username}</code> n'est pas en pause."
+                # Retirer le # devant
+                indent = line[:len(line) - len(stripped)]
+                rest = stripped[1:].lstrip()  # retire # et espaces
+                line = f"{indent}{rest}"
+                found_line_idx = idx
+        new_lines.append(line)
+
+    if found_line_idx is None:
+        valid = [u for u, _ in ACCOUNTS if u.lower() == username.lower()]
+        if valid:
+            return False, f"⚠️ <code>{username}</code> n'est pas dans accounts.py (peut-être déjà retiré ?)."
+        return False, f"❌ Compte <code>{username}</code> introuvable dans accounts.py."
+
+    new_content = "".join(new_lines)
+    action = "Pause" if pause else "Resume"
+    commit_msg = f"{action} {username} via Telegram command"
+    success = github_put_file(ACCOUNTS_FILE_PATH, new_content, sha, commit_msg)
+    if success:
+        verb = "mis en pause" if pause else "réactivé"
+        return True, (
+            f"✅ <code>{username}</code> {verb}.\n"
+            f"Railway va redéployer automatiquement dans ~30 sec."
+        )
+    return False, "⚠️ Erreur lors du commit GitHub. Vérifie le GITHUB_TOKEN."
 
 
 # ============================================================================
@@ -226,6 +375,14 @@ def get_reel_shortcode(reel: dict) -> str:
     return str(reel.get("code") or reel.get("shortcode") or reel.get("pk") or "")
 
 
+def reel_link(reel: dict) -> str:
+    """Renvoie un lien HTML vers le Reel, ou chaîne vide si pas de shortcode."""
+    sc = get_reel_shortcode(reel)
+    if not sc:
+        return ""
+    return f' · <a href="https://www.instagram.com/reel/{sc}/">voir</a>'
+
+
 def format_number(n) -> str:
     try:
         n = int(n)
@@ -238,20 +395,24 @@ def format_number(n) -> str:
     return str(n)
 
 
+def reel_post_dt(reel: dict) -> Optional[datetime]:
+    taken_at, _, _, _ = parse_reel_stats(reel)
+    if not taken_at:
+        return None
+    try:
+        ts = int(taken_at)
+        return datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(PARIS_TZ)
+    except (ValueError, TypeError):
+        return None
+
+
 def find_post_in_window(items: list, target_time_paris: time):
     today_paris = datetime.now(PARIS_TZ).date()
     target_dt = PARIS_TZ.localize(datetime.combine(today_paris, target_time_paris))
     out_of_window = None
     for item in items:
-        taken_at, _, _, _ = parse_reel_stats(item)
-        if not taken_at:
-            continue
-        try:
-            ts = int(taken_at)
-            post_dt = datetime.fromtimestamp(ts, tz=pytz.UTC).astimezone(PARIS_TZ)
-        except (ValueError, TypeError):
-            continue
-        if post_dt.date() != today_paris:
+        post_dt = reel_post_dt(item)
+        if not post_dt or post_dt.date() != today_paris:
             continue
         delta_min = abs((post_dt - target_dt).total_seconds()) / 60
         if delta_min <= WINDOW_MINUTES:
@@ -321,7 +482,6 @@ def load_gms_links_map() -> dict:
         if not cursor:
             break
         if page > 20:
-            log.warning("GMS pagination > 20 pages, stop")
             break
     _GMS_LINKS_CACHE = mapping
     _GMS_CACHE_LAST_REFRESH = now
@@ -405,7 +565,7 @@ def fetch_gms_clicks_and_countries(link_id: str, period: str) -> tuple:
 
 
 # ============================================================================
-#  PERSISTENCE — sauvegarde dans Supabase
+#  PERSISTENCE
 # ============================================================================
 
 def save_reel(username: str, reel: dict) -> None:
@@ -468,7 +628,7 @@ def save_clicks(username: str, period: str, clicks: Optional[int], top_countries
 
 
 # ============================================================================
-#  ALERTES — détection + anti-spam
+#  ALERTES
 # ============================================================================
 
 def has_recent_alert(alert_type: str, target: str, hours: int = ALERT_DEDUP_HOURS) -> bool:
@@ -500,7 +660,6 @@ def log_and_send_alert(alert_type: str, target: str, message: str,
 
 
 def detect_shadowban(username: str) -> None:
-    """Détecte un possible shadowban après save d'un nouveau Reel."""
     rows = supabase_select(
         "reels_history",
         {
@@ -515,11 +674,11 @@ def detect_shadowban(username: str) -> None:
     reference = rows[SHADOWBAN_CONSECUTIVE:SHADOWBAN_CONSECUTIVE + SHADOWBAN_REFERENCE_REELS]
     avg_views = sum(r.get("views", 0) for r in reference) / max(len(reference), 1)
     if avg_views < 100:
-        return  # baseline trop faible, bruit
+        return
     threshold = avg_views * SHADOWBAN_DROP_RATIO
     for r in last_n:
         if (r.get("views", 0) or 0) >= threshold:
-            return  # pas tous en chute
+            return
     last_views = last_n[0].get("views", 0)
     msg = (
         f"🔇 <b>ALERTE SHADOWBAN</b>\n"
@@ -535,7 +694,6 @@ def detect_shadowban(username: str) -> None:
 
 
 def detect_clicks_drop(username: str, today_clicks: int) -> None:
-    """Détecte chute clics jour J vs J-1."""
     yesterday = (datetime.now(PARIS_TZ) - timedelta(days=1)).date()
     rows = supabase_select(
         "daily_clicks",
@@ -567,8 +725,6 @@ def detect_clicks_drop(username: str, today_clicks: int) -> None:
 
 
 def detect_va_underperf_for_recap() -> list:
-    """Renvoie la liste des VA en sous-perf sur les 7 derniers jours.
-    Retourne [(va_name, count_misses, total_slots), ...]."""
     today = datetime.now(PARIS_TZ).date()
     since = (today - timedelta(days=VA_UNDERPERF_DAYS - 1)).isoformat()
     rows = supabase_select(
@@ -596,7 +752,7 @@ def detect_va_underperf_for_recap() -> list:
 
 
 # ============================================================================
-#  RAPPORTS INSTAGRAM (matin/soir) — avec save + alertes
+#  RAPPORTS INSTAGRAM (matin/soir)
 # ============================================================================
 
 def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -> str:
@@ -619,17 +775,10 @@ def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -
         for username in usernames:
             total_accounts += 1
             reels = fetch_recent_reels(username)
-
-            # Sauvegarde TOUS les Reels du fetch dans Supabase
-            for r in reels[:10]:  # max 10 pour ne pas spam
+            for r in reels[:10]:
                 save_reel(username, r)
-
             status, post_dt, item = find_post_in_window(reels, target_time_paris)
-
-            # Sauvegarde du statut de ce créneau
             save_post_status(username, va_name, slot_name, status, post_dt, item)
-
-            # Détection shadowban (après save)
             detect_shadowban(username)
 
             if status == "in_window":
@@ -637,10 +786,8 @@ def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -
                 total_ok += 1
                 _, views, likes, comments = parse_reel_stats(item)
                 hhmm = post_dt.strftime("%Hh%M")
-                shortcode = get_reel_shortcode(item)
-                link_part = f" · <a href=\"https://www.instagram.com/reel/{shortcode}/\">voir</a>" if shortcode else ""
                 va_lines.append(
-                    f"  ✅ <code>{username}</code> — Posté {hhmm}{link_part}\n"
+                    f"  ✅ <code>{username}</code> — Posté {hhmm}{reel_link(item)}\n"
                     f"     👁 {format_number(views)} vues · "
                     f"❤️ {format_number(likes)} · "
                     f"💬 {format_number(comments)}"
@@ -650,10 +797,8 @@ def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -
                 total_out += 1
                 _, views, likes, comments = parse_reel_stats(item)
                 hhmm = post_dt.strftime("%Hh%M")
-                shortcode = get_reel_shortcode(item)
-                link_part = f" · <a href=\"https://www.instagram.com/reel/{shortcode}/\">voir</a>" if shortcode else ""
                 va_lines.append(
-                    f"  ⚠️ <code>{username}</code> — Hors créneau ({hhmm}){link_part}\n"
+                    f"  ⚠️ <code>{username}</code> — Hors créneau ({hhmm}){reel_link(item)}\n"
                     f"     👁 {format_number(views)} vues · "
                     f"❤️ {format_number(likes)} · "
                     f"💬 {format_number(comments)}"
@@ -681,7 +826,7 @@ def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -
 
 
 # ============================================================================
-#  RAPPORTS CLICS (00h/12h) — avec save + alertes
+#  RAPPORTS CLICS (00h/12h)
 # ============================================================================
 
 def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
@@ -712,24 +857,15 @@ def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
         for username in usernames:
             link_id = find_gms_link_id(username, links_map)
             if not link_id:
-                va_lines.append(
-                    f"  ❓ <code>{username}</code> — Lien GMS introuvable"
-                )
+                va_lines.append(f"  ❓ <code>{username}</code> — Lien GMS introuvable")
                 continue
             clicks, countries = fetch_gms_clicks_and_countries(link_id, period)
             if clicks is None:
-                va_lines.append(
-                    f"  ⚠️ <code>{username}</code> — Stats indisponibles"
-                )
+                va_lines.append(f"  ⚠️ <code>{username}</code> — Stats indisponibles")
                 continue
-
-            # Sauvegarde
             save_clicks(username, period, clicks, countries)
-
-            # Détection chute clics (uniquement sur rapport JOUR COMPLET = period yesterday)
             if period == "yesterday":
                 detect_clicks_drop(username, int(clicks))
-
             total_clicks_global += clicks
             countries_str = (
                 " ".join(f"{c} ({p}%)" for c, p in countries) if countries else "—"
@@ -748,17 +884,13 @@ def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
 
 
 # ============================================================================
-#  RÉCAP HEBDOMADAIRE (dimanche 20h05)
+#  AGRÉGATIONS (récap hebdo / mensuel + leaderboard)
 # ============================================================================
 
 def fetch_aggregated_clicks(start_date: date, end_date: date) -> dict:
-    """Renvoie { username: total_clicks } sur la période donnée."""
     rows = supabase_select(
         "daily_clicks",
-        {
-            "date": f"gte.{start_date.isoformat()}",
-            "limit": 10000,
-        },
+        {"date": f"gte.{start_date.isoformat()}", "limit": 10000},
     )
     result: dict = {}
     for r in rows:
@@ -776,13 +908,9 @@ def fetch_aggregated_clicks(start_date: date, end_date: date) -> dict:
 
 
 def fetch_aggregated_views(start_date: date, end_date: date) -> dict:
-    """Renvoie { username: total_views } sur les Reels postés dans la période."""
     rows = supabase_select(
         "reels_history",
-        {
-            "taken_at": f"gte.{start_date.isoformat()}",
-            "limit": 10000,
-        },
+        {"taken_at": f"gte.{start_date.isoformat()}", "limit": 10000},
     )
     result: dict = {}
     for r in rows:
@@ -800,13 +928,9 @@ def fetch_aggregated_views(start_date: date, end_date: date) -> dict:
 
 
 def aggregate_country_clicks(start_date: date, end_date: date) -> list:
-    """Top 3 pays consolidés sur la période. Retourne [(code, pct), ...]."""
     rows = supabase_select(
         "daily_clicks",
-        {
-            "date": f"gte.{start_date.isoformat()}",
-            "limit": 10000,
-        },
+        {"date": f"gte.{start_date.isoformat()}", "limit": 10000},
     )
     country_totals: dict = {}
     for r in rows:
@@ -819,8 +943,6 @@ def aggregate_country_clicks(start_date: date, end_date: date) -> list:
             continue
         clicks = r.get("clicks", 0) or 0
         countries = r.get("top_countries") or []
-        if not countries:
-            continue
         for entry in countries:
             code = entry.get("code") or "??"
             pct = entry.get("pct", 0) or 0
@@ -833,10 +955,9 @@ def aggregate_country_clicks(start_date: date, end_date: date) -> list:
 
 
 def generate_recap_hebdo() -> str:
-    """Récap dimanche soir 20h05 : classement VA + alertes sous-perf + stats globales."""
     now_paris = datetime.now(PARIS_TZ)
     today = now_paris.date()
-    week_start = today - timedelta(days=6)         # 7 jours en cours
+    week_start = today - timedelta(days=6)
     prev_week_start = today - timedelta(days=13)
     prev_week_end = today - timedelta(days=7)
 
@@ -845,7 +966,6 @@ def generate_recap_hebdo() -> str:
         "",
     ]
 
-    # --- Classement VA (clics moyens par compte) ---
     va_to_users: dict = {}
     for username, va_name in ACCOUNTS:
         va_to_users.setdefault(va_name, []).append(username)
@@ -873,7 +993,6 @@ def generate_recap_hebdo() -> str:
         )
     lines.append("")
 
-    # --- Évolution clics totaux ---
     total_clicks_now = sum(clicks_this_week.values())
     total_clicks_prev = sum(clicks_prev_week.values())
     if total_clicks_prev > 0:
@@ -886,9 +1005,8 @@ def generate_recap_hebdo() -> str:
         )
     else:
         lines.append(f"🔗 <b>Clics totaux :</b> {format_number(total_clicks_now)} "
-                     f"(pas de comparaison disponible)")
+                     f"(pas de comparaison)")
 
-    # --- Évolution vues totales ---
     total_views_now = sum(views_this_week.values())
     total_views_prev = sum(views_prev_week.values())
     if total_views_prev > 0:
@@ -901,16 +1019,14 @@ def generate_recap_hebdo() -> str:
         )
     else:
         lines.append(f"👁 <b>Vues totales :</b> {format_number(total_views_now)} "
-                     f"(pas de comparaison disponible)")
+                     f"(pas de comparaison)")
 
-    # --- Top 3 pays ---
     top_countries = aggregate_country_clicks(week_start, today)
     if top_countries:
         cstr = " · ".join(f"{c} ({p}%)" for c, p in top_countries)
         lines.append(f"🌍 <b>Top 3 pays :</b> {cstr}")
     lines.append("")
 
-    # --- Alertes VA sous-perf ---
     underperf = detect_va_underperf_for_recap()
     if underperf:
         lines.append("⚠️ <b>VA en sous-perf cette semaine</b>")
@@ -924,34 +1040,24 @@ def generate_recap_hebdo() -> str:
     return "\n".join(lines)
 
 
-# ============================================================================
-#  RÉCAP MENSUEL (1er du mois 09h35)
-# ============================================================================
-
 def generate_recap_mensuel() -> str:
     now_paris = datetime.now(PARIS_TZ)
     today = now_paris.date()
-    # Le 1er du mois → on récapitule le mois précédent complet
     last_day_prev = today.replace(day=1) - timedelta(days=1)
     first_day_prev = last_day_prev.replace(day=1)
     days_in_month = (last_day_prev - first_day_prev).days + 1
-    # Mois M-2 pour comparaison
     last_day_prev_prev = first_day_prev - timedelta(days=1)
     first_day_prev_prev = last_day_prev_prev.replace(day=1)
 
     month_name = first_day_prev.strftime("%B %Y")
 
-    lines = [
-        f"📆 <b>RÉCAP MENSUEL — {month_name}</b>",
-        "",
-    ]
+    lines = [f"📆 <b>RÉCAP MENSUEL — {month_name}</b>", ""]
 
     clicks_m = fetch_aggregated_clicks(first_day_prev, last_day_prev)
     clicks_m_prev = fetch_aggregated_clicks(first_day_prev_prev, last_day_prev_prev)
     views_m = fetch_aggregated_views(first_day_prev, last_day_prev)
     views_m_prev = fetch_aggregated_views(first_day_prev_prev, last_day_prev_prev)
 
-    # Classement VA
     va_to_users: dict = {}
     for username, va_name in ACCOUNTS:
         va_to_users.setdefault(va_name, []).append(username)
@@ -1009,41 +1115,302 @@ def generate_recap_mensuel() -> str:
 
 
 # ============================================================================
+#  COMMANDES INTERACTIVES (handlers)
+# ============================================================================
+
+def cmd_help() -> str:
+    return (
+        "🤖 <b>Commandes disponibles</b>\n\n"
+        "<b>Consultation</b>\n"
+        "  /today — snapshot live de tous les comptes\n"
+        "  /stats &lt;username&gt; — stats d'un compte\n"
+        "  /week — récap des 7 derniers jours\n"
+        "  /top — top 3 Reels du jour\n"
+        "  /leaderboard — classement VA live\n\n"
+        "<b>Action</b>\n"
+        "  /pause &lt;username&gt; — met un compte en pause\n"
+        "  /resume &lt;username&gt; — réactive un compte\n"
+        "  /help — affiche cette aide"
+    )
+
+
+def cmd_today() -> str:
+    now_paris = datetime.now(PARIS_TZ)
+    today = now_paris.date()
+
+    va_groups: dict = {}
+    for username, va_name in ACCOUNTS:
+        va_groups.setdefault(va_name, []).append(username)
+
+    lines = [
+        f"📸 <b>SNAPSHOT LIVE</b> — {now_paris.strftime('%d/%m %H:%M')}",
+        "",
+    ]
+    total_posts = 0
+
+    for va_name, usernames in va_groups.items():
+        lines.append(f"👤 <b>{va_name}</b>")
+        for username in usernames:
+            reels = fetch_recent_reels(username)
+            today_reels = []
+            for r in reels[:8]:
+                post_dt = reel_post_dt(r)
+                if post_dt and post_dt.date() == today:
+                    today_reels.append((post_dt, r))
+            if today_reels:
+                total_posts += len(today_reels)
+                lines.append(f"  ✅ <code>{username}</code> ({len(today_reels)} post(s) aujourd'hui)")
+                for post_dt, r in today_reels:
+                    _, views, likes, _ = parse_reel_stats(r)
+                    lines.append(
+                        f"     {post_dt.strftime('%Hh%M')} — "
+                        f"👁 {format_number(views)} · ❤️ {format_number(likes)}{reel_link(r)}"
+                    )
+            else:
+                lines.append(f"  ❌ <code>{username}</code> — pas de post aujourd'hui")
+        lines.append("")
+
+    lines.append(f"📈 <b>{total_posts} posts aujourd'hui</b>")
+    return "\n".join(lines)
+
+
+def cmd_stats(username: str) -> str:
+    valid_usernames = [u for u, _ in ACCOUNTS]
+    matched = None
+    for u in valid_usernames:
+        if u.lower() == username.lower():
+            matched = u
+            break
+    if not matched:
+        return (
+            f"❌ Compte <code>{username}</code> non trouvé.\n\n"
+            f"Comptes valides :\n" +
+            "\n".join(f"  • <code>{u}</code>" for u in valid_usernames)
+        )
+    username = matched
+
+    now_paris = datetime.now(PARIS_TZ)
+    today = now_paris.date()
+    yesterday = (now_paris - timedelta(days=1)).date()
+
+    reels = fetch_recent_reels(username)
+
+    lines = [
+        f"📊 <b>STATS LIVE — {username}</b>",
+        f"<i>{now_paris.strftime('%d/%m %H:%M')}</i>",
+        "",
+    ]
+
+    if not reels:
+        lines.append("⚠️ Impossible de récupérer les Reels.")
+        return "\n".join(lines)
+
+    lines.append("<b>5 derniers Reels</b>")
+    for r in reels[:5]:
+        _, views, likes, comments = parse_reel_stats(r)
+        post_dt = reel_post_dt(r)
+        date_str = post_dt.strftime("%d/%m %Hh%M") if post_dt else "?"
+        lines.append(
+            f"  • {date_str} — 👁 {format_number(views)} · "
+            f"❤️ {format_number(likes)} · 💬 {format_number(comments)}{reel_link(r)}"
+        )
+    lines.append("")
+
+    lines.append("<b>Clics GMS</b>")
+    rows_today = supabase_select(
+        "daily_clicks",
+        {"username": f"eq.{username}", "date": f"eq.{today.isoformat()}", "limit": 1},
+    )
+    rows_yest = supabase_select(
+        "daily_clicks",
+        {"username": f"eq.{username}", "date": f"eq.{yesterday.isoformat()}", "limit": 1},
+    )
+
+    if rows_today:
+        clicks = rows_today[0].get("clicks", 0) or 0
+        countries = rows_today[0].get("top_countries", []) or []
+        cstr = " · ".join(f"{c.get('code', '??')} ({c.get('pct', 0)}%)" for c in countries[:3]) if countries else "—"
+        lines.append(f"  Aujourd'hui : <b>{format_number(clicks)}</b> clics · 🌍 {cstr}")
+    else:
+        lines.append("  Aujourd'hui : pas encore de data")
+
+    if rows_yest:
+        lines.append(f"  Hier : <b>{format_number(rows_yest[0].get('clicks', 0) or 0)}</b> clics")
+
+    return "\n".join(lines)
+
+
+def cmd_top() -> str:
+    now_paris = datetime.now(PARIS_TZ)
+    today = now_paris.date()
+
+    all_reels = []
+    for username, va_name in ACCOUNTS:
+        reels = fetch_recent_reels(username)
+        for r in reels[:5]:
+            post_dt = reel_post_dt(r)
+            if not post_dt or post_dt.date() != today:
+                continue
+            _, views, likes, comments = parse_reel_stats(r)
+            all_reels.append((username, va_name, post_dt, views, likes, comments, r))
+
+    if not all_reels:
+        return "📭 Aucun Reel publié aujourd'hui."
+
+    all_reels.sort(key=lambda x: x[3] or 0, reverse=True)
+    top3 = all_reels[:3]
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [
+        f"🔥 <b>TOP 3 REELS DU JOUR</b>",
+        f"<i>{now_paris.strftime('%d/%m %H:%M')}</i>",
+        "",
+    ]
+    for i, (username, va_name, post_dt, views, likes, comments, r) in enumerate(top3):
+        lines.append(
+            f"{medals[i]} <code>{username}</code> ({va_name})\n"
+            f"   Posté {post_dt.strftime('%Hh%M')}{reel_link(r)}\n"
+            f"   👁 {format_number(views)} · ❤️ {format_number(likes)} · 💬 {format_number(comments)}"
+        )
+
+    return "\n".join(lines)
+
+
+def cmd_leaderboard() -> str:
+    today = datetime.now(PARIS_TZ).date()
+    week_start = today - timedelta(days=6)
+
+    clicks = fetch_aggregated_clicks(week_start, today)
+
+    va_to_users: dict = {}
+    for username, va_name in ACCOUNTS:
+        va_to_users.setdefault(va_name, []).append(username)
+
+    va_scores = []
+    for va_name, usernames in va_to_users.items():
+        total = sum(clicks.get(u, 0) for u in usernames)
+        nb = len(usernames) or 1
+        avg = total / nb
+        va_scores.append((va_name, total, avg, nb))
+    va_scores.sort(key=lambda x: x[2], reverse=True)
+
+    lines = [f"🏆 <b>CLASSEMENT VA</b> (7 derniers jours)", ""]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (va, total, avg, nb) in enumerate(va_scores):
+        medal = medals[i] if i < 3 else "•"
+        lines.append(
+            f"{medal} <b>{va}</b> — {format_number(int(avg))} clics moy. "
+            f"({format_number(int(total))} total · {nb} comptes)"
+        )
+    return "\n".join(lines)
+
+
+def handle_command(text: str) -> Optional[str]:
+    """Dispatch d'une commande. Renvoie la réponse ou None si commande inconnue."""
+    parts = text.strip().split()
+    if not parts or not parts[0].startswith("/"):
+        return None
+    # Gère /command@bot_name
+    cmd = parts[0].lower().split("@")[0]
+    args = parts[1:]
+
+    try:
+        if cmd == "/help" or cmd == "/start":
+            return cmd_help()
+        elif cmd == "/today":
+            return cmd_today()
+        elif cmd == "/stats":
+            if not args:
+                return "Usage : <code>/stats &lt;username&gt;</code>"
+            return cmd_stats(args[0])
+        elif cmd == "/week":
+            return generate_recap_hebdo()
+        elif cmd == "/top":
+            return cmd_top()
+        elif cmd == "/leaderboard":
+            return cmd_leaderboard()
+        elif cmd == "/pause":
+            if not args:
+                return "Usage : <code>/pause &lt;username&gt;</code>"
+            _, msg = toggle_account_pause(args[0], pause=True)
+            return msg
+        elif cmd == "/resume":
+            if not args:
+                return "Usage : <code>/resume &lt;username&gt;</code>"
+            _, msg = toggle_account_pause(args[0], pause=False)
+            return msg
+    except Exception as e:
+        log.error("Command %s exception: %s", cmd, e)
+        return f"⚠️ Erreur lors de l'exécution de {cmd}"
+    return None
+
+
+def telegram_polling_loop() -> None:
+    """Boucle infinie de polling Telegram. Tourne dans le thread principal."""
+    log.info("Telegram polling started")
+    # On commence avec un offset basé sur le dernier update connu (skip backlog)
+    initial = poll_telegram_updates(-1)
+    last_update_id = initial[-1]["update_id"] + 1 if initial else 0
+
+    while True:
+        try:
+            updates = poll_telegram_updates(last_update_id)
+            for update in updates:
+                last_update_id = max(last_update_id, update["update_id"] + 1)
+                message = update.get("message") or update.get("channel_post")
+                if not message:
+                    continue
+                text = message.get("text", "")
+                if not text or not text.startswith("/"):
+                    continue
+                chat_id = message.get("chat", {}).get("id")
+                # Filtre : on n'accepte les commandes que depuis le canal configuré
+                if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                    continue
+                response = handle_command(text)
+                if response:
+                    send_telegram(response)
+        except Exception as e:
+            log.error("Polling loop error: %s", e)
+            time_module.sleep(5)
+
+
+# ============================================================================
 #  JOBS PROGRAMMÉS
 # ============================================================================
 
 def job_insta_matin() -> None:
-    log.info("Running INSTA MATIN job")
+    log.info("Job INSTA MATIN")
     send_telegram(generate_insta_report(MATIN_TARGET, "INSTA MATIN", "matin"))
 
 
 def job_insta_soir() -> None:
-    log.info("Running INSTA SOIR job")
+    log.info("Job INSTA SOIR")
     send_telegram(generate_insta_report(SOIR_TARGET, "INSTA SOIR", "soir"))
 
 
 def job_clics_minuit() -> None:
-    log.info("Running CLICS MINUIT job (jour J-1)")
+    log.info("Job CLICS MINUIT (jour J-1)")
     send_telegram(generate_clicks_report("yesterday", "CLICS — JOUR COMPLET", "🌙"))
 
 
 def job_clics_midi() -> None:
-    log.info("Running CLICS MIDI job (depuis 00h)")
+    log.info("Job CLICS MIDI (depuis 00h)")
     send_telegram(generate_clicks_report("today", "CLICS — MI-JOURNÉE", "☀️"))
 
 
 def job_recap_hebdo() -> None:
-    log.info("Running RECAP HEBDO job")
+    log.info("Job RECAP HEBDO")
     send_telegram(generate_recap_hebdo())
 
 
 def job_recap_mensuel() -> None:
-    log.info("Running RECAP MENSUEL job")
+    log.info("Job RECAP MENSUEL")
     send_telegram(generate_recap_mensuel())
 
 
 # ============================================================================
-#  STARTUP
+#  STARTUP / MAIN
 # ============================================================================
 
 def send_startup_message() -> None:
@@ -1051,19 +1418,22 @@ def send_startup_message() -> None:
     nb_va = len({va for _, va in ACCOUNTS})
     gms_status = "✅ activé" if GMS_API_KEY else "⚠️ désactivé"
     sb_status = "✅ activé" if (SUPABASE_URL and SUPABASE_KEY) else "⚠️ désactivé"
+    gh_status = "✅ activé" if (GITHUB_TOKEN and GITHUB_REPO) else "⚠️ désactivé"
     msg = (
         "🟢 <b>Bot démarré</b>\n"
         f"📊 {nb_comptes} comptes surveillés\n"
         f"👥 {nb_va} VA\n"
         f"🔗 GetMySocial : {gms_status}\n"
         f"💾 Supabase : {sb_status}\n"
+        f"🛠 GitHub auto-commit : {gh_status}\n"
         "⏰ Rapports automatiques :\n"
         "   🌙 00h00 — Clics jour complet\n"
         "   🌅 09h30 — Insta matin\n"
         "   ☀️ 12h00 — Clics mi-journée\n"
         "   🌆 20h00 — Insta soir\n"
         "   📅 Dimanche 20h05 — Récap hebdo\n"
-        "   📆 1er du mois 09h35 — Récap mensuel"
+        "   📆 1er du mois 09h35 — Récap mensuel\n"
+        "💬 Tape <code>/help</code> pour voir les commandes"
     )
     send_telegram(msg)
 
@@ -1072,19 +1442,17 @@ def main() -> None:
     log.info("Starting bot — %d comptes surveillés", len(ACCOUNTS))
     send_startup_message()
 
-    scheduler = BlockingScheduler(timezone=PARIS_TZ)
-
-    # ===== JOBS PROGRAMMÉS =====
+    scheduler = BackgroundScheduler(timezone=PARIS_TZ)
     scheduler.add_job(job_clics_minuit, "cron", hour=0,  minute=0)
     scheduler.add_job(job_insta_matin,  "cron", hour=9,  minute=30)
     scheduler.add_job(job_clics_midi,   "cron", hour=12, minute=0)
     scheduler.add_job(job_insta_soir,   "cron", hour=20, minute=0)
     scheduler.add_job(job_recap_hebdo,  "cron", day_of_week="sun", hour=20, minute=5)
     scheduler.add_job(job_recap_mensuel,"cron", day=1, hour=9, minute=35)
-    # ===========================
-
-    log.info("Scheduler started — waiting for jobs")
     scheduler.start()
+
+    log.info("Scheduler started in background — entering Telegram polling loop")
+    telegram_polling_loop()
 
 
 if __name__ == "__main__":
